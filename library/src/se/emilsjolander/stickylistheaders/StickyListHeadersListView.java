@@ -14,6 +14,7 @@ import android.util.Log;
 import android.util.SparseBooleanArray;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.widget.AbsListView;
 import android.widget.AbsListView.MultiChoiceModeListener;
@@ -27,10 +28,10 @@ import android.widget.SectionIndexer;
 import se.emilsjolander.stickylistheaders.WrapperViewList.LifeCycleListener;
 
 /**
- * Even though this is a FrameLayout subclass we it is called a ListView. This
- * is because of 2 reasons. 1. It acts like as ListView 2. It used to be a
- * ListView subclass and i did not was to change to name causing compatibility
- * errors.
+ * Even though this is a FrameLayout subclass we still consider it a ListView.
+ * This is because of 2 reasons:
+ *   1. It acts like as ListView.
+ *   2. It used to be a ListView subclass and refactoring the name would cause compatibility errors.
  *
  * @author Emil Sjölander
  */
@@ -97,6 +98,11 @@ public class StickyListHeadersListView extends FrameLayout {
     private int mPaddingRight = 0;
     private int mPaddingBottom = 0;
 
+    /* --- Touch handling --- */
+    private float mDownY;
+    private boolean mHeaderOwnsTouch;
+    private float mTouchSlop;
+
     /* --- Other --- */
     private OnHeaderClickListener mOnHeaderClickListener;
     private OnStickyHeaderOffsetChangedListener mOnStickyHeaderOffsetChangedListener;
@@ -110,12 +116,14 @@ public class StickyListHeadersListView extends FrameLayout {
     }
 
     public StickyListHeadersListView(Context context, AttributeSet attrs) {
-        this(context, attrs, 0);
+        this(context, attrs, R.attr.stickyListHeadersListViewStyle);
     }
 
     @TargetApi(Build.VERSION_CODES.HONEYCOMB)
     public StickyListHeadersListView(Context context, AttributeSet attrs, int defStyle) {
         super(context, attrs, defStyle);
+
+        mTouchSlop = ViewConfiguration.get(getContext()).getScaledTouchSlop();
 
         // Initialize the wrapped list
         mList = new WrapperViewList(context);
@@ -127,7 +135,7 @@ public class StickyListHeadersListView extends FrameLayout {
         mList.setDividerHeight(0);
 
         if (attrs != null) {
-            TypedArray a = context.getTheme().obtainStyledAttributes(attrs,R.styleable.StickyListHeadersListView, 0, 0);
+            TypedArray a = context.getTheme().obtainStyledAttributes(attrs,R.styleable.StickyListHeadersListView, defStyle, 0);
 
             try {
                 // -- View attributes --
@@ -196,6 +204,8 @@ public class StickyListHeadersListView extends FrameLayout {
                 if (a.hasValue(R.styleable.StickyListHeadersListView_android_divider)) {
                     mDivider = a.getDrawable(R.styleable.StickyListHeadersListView_android_divider);
                 }
+                
+                mList.setStackFromBottom(a.getBoolean(R.styleable.StickyListHeadersListView_android_stackFromBottom, false));
 
                 mDividerHeight = a.getDimensionPixelSize(R.styleable.StickyListHeadersListView_android_dividerHeight,
                         mDividerHeight);
@@ -255,7 +265,7 @@ public class StickyListHeadersListView extends FrameLayout {
         mList.layout(0, 0, mList.getMeasuredWidth(), getHeight());
         if (mHeader != null) {
             MarginLayoutParams lp = (MarginLayoutParams) mHeader.getLayoutParams();
-            int headerTop = lp.topMargin + stickyHeaderTop();
+            int headerTop = lp.topMargin;
             mHeader.layout(mPaddingLeft, headerTop, mHeader.getMeasuredWidth()
                     + mPaddingLeft, headerTop + mHeader.getMeasuredHeight());
         }
@@ -347,18 +357,17 @@ public class StickyListHeadersListView extends FrameLayout {
             }
         }
 
-        int headerOffset = 0;
+        int headerOffset = stickyHeaderTop();
 
         // Calculate new header offset
         // Skip looking at the first view. it never matters because it always
         // results in a headerOffset = 0
-        int headerBottom = mHeader.getMeasuredHeight() + stickyHeaderTop();
         for (int i = 0; i < mList.getChildCount(); i++) {
             final View child = mList.getChildAt(i);
             final boolean doesChildHaveHeader = child instanceof WrapperView && ((WrapperView) child).hasHeader();
             final boolean isChildFooter = mList.containsFooterView(child);
             if (child.getTop() >= stickyHeaderTop() && (doesChildHaveHeader || isChildFooter)) {
-                headerOffset = Math.min(child.getTop() - headerBottom, 0);
+                headerOffset = Math.min(child.getTop() - mHeader.getMeasuredHeight(), headerOffset);
                 break;
             }
         }
@@ -395,12 +404,7 @@ public class StickyListHeadersListView extends FrameLayout {
     // hides the headers in the list under the sticky header.
     // Makes sure the other ones are showing
     private void updateHeaderVisibilities() {
-        int top;
-        if (mHeader != null) {
-            top = mHeader.getMeasuredHeight() + (mHeaderOffset != null ? mHeaderOffset : 0) + mStickyHeaderTopOffset;
-        } else {
-            top = stickyHeaderTop();
-        }
+        int top = stickyHeaderTop();
         int childCount = mList.getChildCount();
         for (int i = 0; i < childCount; i++) {
 
@@ -447,6 +451,39 @@ public class StickyListHeadersListView extends FrameLayout {
                 mOnStickyHeaderOffsetChangedListener.onStickyHeaderOffsetChanged(this, mHeader, -mHeaderOffset);
             }
         }
+    }
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        int action = ev.getAction() & MotionEvent.ACTION_MASK;
+        if (action == MotionEvent.ACTION_DOWN) {
+            mDownY = ev.getY();
+            mHeaderOwnsTouch = mHeader != null && mDownY <= mHeader.getHeight() + mHeaderOffset;
+        }
+
+        boolean handled;
+        if (mHeaderOwnsTouch) {
+            if (mHeader != null && Math.abs(mDownY - ev.getY()) <= mTouchSlop) {
+                handled = mHeader.dispatchTouchEvent(ev);
+            } else {
+                if (mHeader != null) {
+                    MotionEvent cancelEvent = MotionEvent.obtain(ev);
+                    cancelEvent.setAction(MotionEvent.ACTION_CANCEL);
+                    mHeader.dispatchTouchEvent(cancelEvent);
+                    cancelEvent.recycle();
+                }
+
+                MotionEvent downEvent = MotionEvent.obtain(ev.getDownTime(), ev.getEventTime(), ev.getAction(), ev.getX(), mDownY, ev.getMetaState());
+                downEvent.setAction(MotionEvent.ACTION_DOWN);
+                handled = mList.dispatchTouchEvent(downEvent);
+                downEvent.recycle();
+                mHeaderOwnsTouch = false;
+            }
+        } else {
+            handled = mList.dispatchTouchEvent(ev);
+        }
+
+        return handled;
     }
 
     private class AdapterWrapperDataSetObserver extends DataSetObserver {
@@ -524,7 +561,7 @@ public class StickyListHeadersListView extends FrameLayout {
         return position == 0 || mAdapter.getHeaderId(position) != mAdapter.getHeaderId(position - 1);
     }
 
-    private int getHeaderOverlap(int position) {
+    public int getHeaderOverlap(int position) {
         boolean isStartOfSection = isStartOfSection(Math.max(0, position - getHeaderViewsCount()));
         if (!isStartOfSection) {
             View header = mAdapter.getHeaderView(position, null, mList);
@@ -652,6 +689,12 @@ public class StickyListHeadersListView extends FrameLayout {
 
     public void setAdapter(StickyListHeadersAdapter adapter) {
         if (adapter == null) {
+            if (mAdapter instanceof SectionIndexerAdapterWrapper) {
+                ((SectionIndexerAdapterWrapper) mAdapter).mSectionIndexerDelegate = null;
+            }
+            if (mAdapter != null) {
+                mAdapter.mDelegate = null;
+            }
             mList.setAdapter(null);
             clearHeader();
             return;
@@ -1073,4 +1116,15 @@ public class StickyListHeadersListView extends FrameLayout {
         mList.setTranscriptMode(mode);
     }
 
+    public void setBlockLayoutChildren(boolean blockLayoutChildren) {
+        mList.setBlockLayoutChildren(blockLayoutChildren);
+    }
+    
+    public void setStackFromBottom(boolean stackFromBottom) {
+    	mList.setStackFromBottom(stackFromBottom);
+    }
+
+    public boolean isStackFromBottom() {
+    	return mList.isStackFromBottom();
+    }
 }
